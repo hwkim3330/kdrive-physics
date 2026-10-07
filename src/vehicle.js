@@ -88,6 +88,13 @@ export class Vehicle {
     this._acc += dt;
     let n = 0;
     while (this._acc >= SUB && n < 40) { this._sub(SUB); this._acc -= SUB; n++; }
+    // never let a bad step poison the sim: fall back to the last finite pose, at rest
+    const ok = [this.p.x, this.p.y, this.p.z, this.vel.x, this.vel.y, this.vel.z, this.w.x, this.w.y, this.w.z, this.q.w].every(Number.isFinite);
+    if (!ok) {
+      const g = this._good || { x: this.x || 0, y: this.y || 0, yaw: this.yaw || 0 };
+      console.warn('vehicle physics reset at', g);
+      this.place(g.x, g.y, g.yaw);
+    } else if (Math.abs(this.vel.z) < 5) this._good = { x: this.x, y: this.y, yaw: this.yaw };
     this._report();
   }
 
@@ -111,14 +118,17 @@ export class Vehicle {
       const sgn = this.gear === 'R' ? -1 : 1;
       if (this.gear === 'D' || this.gear === 'R') {
         const tAxle = Math.min(T_MAX * 2, P_MAX / Math.max(Math.abs(vx), 1) * R_W);
-        drive = sgn * c.throttle * tAxle * (this.gear === 'R' ? 0.35 : 1);
+        drive = sgn * c.throttle * tAxle * (this.gear === 'R' ? 0.35 : 1) * (this.powerScale ?? 1);
         if (this.gear === 'R' && -vx > 3.2) drive = 0;                          // reverse capped ~11 km/h
         // one-pedal regen when the accelerator is lifted
-        if (c.throttle < 0.02 && Math.abs(vx) > 0.3) brake += MASS * Math.min(1.6, 0.35 + Math.abs(vx) * 0.06) * R_W;
+        // lift-off regen: level 0..3, or i-Pedal (4) which brakes all the way to a stop and holds
+        const lvl = this.regenLevel ?? 4;
+        const regen = [0, 0.6, 1.1, 1.6, 2.2][lvl];
+        if (c.throttle < 0.02 && (Math.abs(vx) > 0.3 || lvl === 4)) brake += MASS * Math.min(regen, (lvl === 4 ? 0.8 : 0.35) * regen + Math.abs(vx) * 0.06) * R_W + (lvl === 4 && Math.abs(vx) < 0.5 ? T_BRAKE * 0.3 : 0);
       }
       brake += c.brake * T_BRAKE;
       if (this.gear === 'P') brake = T_BRAKE;
-      this.braking = c.brake > 0.05 || (c.throttle < 0.02 && Math.abs(vx) > 0.5);
+      this.braking = c.brake > 0.05 || (c.throttle < 0.02 && Math.abs(vx) > 0.5 && (this.regenLevel ?? 4) >= 2);
     }
     return { drive, brake };
   }
@@ -149,6 +159,14 @@ export class Vehicle {
       wh.compPrev = wh.comp; wh.comp = THREE.MathUtils.clamp(comp, -1, TRAVEL + 0.2);
       hit.push({ hp, g, gpt });
     }
+    // penetration past the bump stop is resolved as a position constraint, not a force: a tile that
+    // loads under the car, or a kerb met at speed, lifts the body instead of launching it
+    const over = Math.max(...this.wheels.map((w) => w.comp - TRAVEL));
+    if (over > 0.01) {
+      this.p.addScaledVector(ez, over);
+      const vn = this.vel.dot(ez); if (vn < 0) this.vel.addScaledVector(ez, -vn);
+      for (const w of this.wheels) { w.comp -= over; w.compPrev = Math.min(w.compPrev, w.comp); }
+    }
     const arbF = [(this.wheels[0].comp - this.wheels[1].comp) * ARB, (this.wheels[2].comp - this.wheels[3].comp) * ARB];
 
     let slipMax = 0;
@@ -175,8 +193,8 @@ export class Vehicle {
       const rate = (wh.comp - wh.compPrev) / dt;
       const side = i % 2 === 0 ? 1 : -1, arb = arbF[front ? 0 : 1] * side;
       let Fz = K_S * Math.min(wh.comp, TRAVEL) + (rate > 0 ? C_BUMP : C_REB) * rate + arb;
-      if (wh.comp > TRAVEL) Fz += 400000 * (wh.comp - TRAVEL);            // bump stop
-      Fz = Math.max(0, Fz);
+      if (wh.comp > TRAVEL) Fz += 200000 * (wh.comp - TRAVEL);            // bump stop (soft; the constraint above does the rest)
+      Fz = Math.min(Math.max(0, Fz), MASS * G * 2.5);
       wh.Fz = Fz;
       // contact frame: wheel heading projected on the ground plane
       const n = g.n;
@@ -239,6 +257,7 @@ export class Vehicle {
     const gyro = new THREE.Vector3().crossVectors(wb, Iw);
     wb.x += ((Tb.x - gyro.x) / I_BODY[0]) * dt; wb.y += ((Tb.y - gyro.y) / I_BODY[1]) * dt; wb.z += ((Tb.z - gyro.z) / I_BODY[2]) * dt;
     this.w.copy(wb.applyMatrix3(R));
+    if (this.w.length() > 8) this.w.setLength(8);
 
     const np = this.p.clone().addScaledVector(this.vel, dt);
     // buildings: test the base_link pose of the next step; a hit kills the motion into the wall
