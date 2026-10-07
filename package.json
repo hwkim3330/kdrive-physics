@@ -1,0 +1,11 @@
+{
+  "name": "kdrive-physics",
+  "version": "0.1.0",
+  "description": "6-DOF vehicle dynamics for browser driving simulators: sprung corners, Pacejka tyres, TCS/ABS",
+  "type": "module",
+  "main": "src/vehicle.js",
+  "scripts": { "test": "node test/physics.mjs" },
+  "peerDependencies": { "three": ">=0.160.0" },
+  "devDependencies": { "three": "0.170.0" },
+  "license": "MIT"
+}
