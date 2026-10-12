@@ -66,7 +66,7 @@ export class Vehicle {
     this.p.set(x + LR * c, y + LR * s, gz + CG_H);
     this.vel.set(0, 0, 0); this.w.set(0, 0, 0);
     for (const wh of this.wheels) { wh.omega = 0; wh.comp = wh.compPrev = SAG; }
-    this.delta = 0; this.a = 0;
+    this.delta = 0; this.a = 0; this.aCmd = 0; this._acceleration = v3();
     this._report();
   }
 
@@ -76,7 +76,7 @@ export class Vehicle {
     this.ray.set(o, this._down); this.ray.far = 800;
     const hit = this.ray.intersectObjects(this.world.drivable, false)[0];
     if (!hit) return null;
-    const n = hit.face ? hit.face.normal : { x: 0, y: 1, z: 0 };
+    const n = hit.face ? hit.face.normal.clone().applyNormalMatrix(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld)) : new THREE.Vector3(0, 1, 0);
     let nx = n.x, ny = -n.z, nz = n.y;                // three (x, y-up, z-south) -> map
     if (nz < 0) { nx = -nx; ny = -ny; nz = -nz; }     // double-sided meshes
     return { z: hit.point.y, n: new THREE.Vector3(nx, ny, nz) };
@@ -117,8 +117,8 @@ export class Vehicle {
     } else {
       const sgn = this.gear === 'R' ? -1 : 1;
       if (this.gear === 'D' || this.gear === 'R') {
-        const tAxle = Math.min(T_MAX * 2, P_MAX / Math.max(Math.abs(vx), 1) * R_W);
-        drive = sgn * c.throttle * tAxle * (this.gear === 'R' ? 0.35 : 1) * (this.powerScale ?? 1);
+        const tAxle = this._driveLimit(vx);
+        drive = sgn * c.throttle * tAxle * (this.gear === 'R' ? 0.35 : 1);
         if (this.gear === 'R' && -vx > 3.2) drive = 0;                          // reverse capped ~11 km/h
         // one-pedal regen when the accelerator is lifted
         // lift-off regen: level 0..3, or i-Pedal (4) which brakes all the way to a stop and holds
@@ -130,10 +130,20 @@ export class Vehicle {
       if (this.gear === 'P') brake = T_BRAKE;
       this.braking = c.brake > 0.05 || (c.throttle < 0.02 && Math.abs(vx) > 0.5 && (this.regenLevel ?? 4) >= 2);
     }
+    const limit = this._driveLimit(vx) * (this.gear === 'R' ? 0.35 : 1);
+    drive = THREE.MathUtils.clamp(drive, -limit, limit);
+    if (this.gear === 'R' && -vx > 3.2) drive = 0;
+    if (this.gear === 'P') brake = T_BRAKE;
     return { drive, brake };
   }
 
+  _driveLimit(vx) {
+    return Math.min(T_MAX / DRIVE_SPLIT, T_MAX / (1 - DRIVE_SPLIT),
+      P_MAX / Math.max(Math.abs(vx), 1) * R_W) * THREE.MathUtils.clamp(this.powerScale ?? 1, 0, 1);
+  }
+
   _sub(dt) {
+    const velocityBefore = this.vel.clone();
     const { drive, brake } = this._commands(dt);
     const R = new THREE.Matrix3().setFromMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(this.q));
     const ex = new THREE.Vector3(1, 0, 0).applyMatrix3(R), ey = new THREE.Vector3(0, 1, 0).applyMatrix3(R), ez = new THREE.Vector3(0, 0, 1).applyMatrix3(R);
@@ -159,16 +169,15 @@ export class Vehicle {
       wh.compPrev = wh.comp; wh.comp = THREE.MathUtils.clamp(comp, -1, TRAVEL + 0.2);
       hit.push({ hp, g, gpt });
     }
-    // penetration past the bump stop is resolved as a position constraint, not a force: a tile that
-    // loads under the car, or a kerb met at speed, lifts the body instead of launching it
-    const over = Math.max(...this.wheels.map((w) => w.comp - TRAVEL));
-    if (over > 0.01) {
-      this.p.addScaledVector(ez, over);
-      const vn = this.vel.dot(ez); if (vn < 0) this.vel.addScaledVector(ez, -vn);
-      for (const w of this.wheels) { w.comp -= over; w.compPrev = Math.min(w.compPrev, w.comp); }
+    // Split position correction: each contact contributes at most 0.5 m/s / four
+    // corners. Spring and bump-stop forces still deliver the impact impulse.
+    for (let i = 0; i < this.wheels.length; i++) {
+      const over = Math.max(0, this.wheels[i].comp - TRAVEL - 0.01);
+      if (hit[i].g && over > 0) this.p.addScaledVector(hit[i].g.n, Math.min(0.2 * over, 0.5 * dt) / 4);
     }
     const arbF = [(this.wheels[0].comp - this.wheels[1].comp) * ARB, (this.wheels[2].comp - this.wheels[3].comp) * ARB];
 
+    const contacts = [];
     let slipMax = 0;
     this.wheels.forEach((wh, i) => {
       const { g, gpt } = hit[i];
@@ -184,7 +193,7 @@ export class Vehicle {
       const tDrive = drive * (front ? DRIVE_SPLIT : 1 - DRIVE_SPLIT) / 2 * (this.aids ? wh.tcs : 1);
       const tBrake = brake * (front ? BRAKE_SPLIT : 1 - BRAKE_SPLIT) / 2 * (this.aids ? wh.abs : 1);
       if (!wh.ground) {
-        wh.Fz = 0;
+        wh.Fz = 0; wh.Fx = 0; wh.Fy = 0;
         wh.omega += (tDrive / I_W) * dt;
         wh.omega -= Math.sign(wh.omega) * Math.min(Math.abs(wh.omega), (tBrake / I_W) * dt);
         return;
@@ -193,7 +202,7 @@ export class Vehicle {
       const rate = (wh.comp - wh.compPrev) / dt;
       const side = i % 2 === 0 ? 1 : -1, arb = arbF[front ? 0 : 1] * side;
       let Fz = K_S * Math.min(wh.comp, TRAVEL) + (rate > 0 ? C_BUMP : C_REB) * rate + arb;
-      if (wh.comp > TRAVEL) Fz += 200000 * (wh.comp - TRAVEL);            // bump stop (soft; the constraint above does the rest)
+      if (wh.comp > TRAVEL) Fz += 200000 * (wh.comp - TRAVEL);            // soft bump stop
       Fz = Math.min(Math.max(0, Fz), MASS * G * 2.5);
       wh.Fz = Fz;
       // contact frame: wheel heading projected on the ground plane
@@ -215,20 +224,15 @@ export class Vehicle {
         wh.kappa = kappa;
         const alpha = Math.atan2(vy, Math.max(speed, 0.5));
         const fx0 = Math.sin(PAC.Cx * Math.atan(PAC.Bx * kappa)), fy0 = -Math.sin(PAC.Cy * Math.atan(PAC.By * alpha));
-        const sx = kappa, sy = Math.tan(alpha), s = Math.hypot(sx, sy) || 1e-6;
-        const comb = Math.hypot(fx0 * sx / s, fy0 * sy / s) > 1 ? 1 / Math.hypot(fx0 * sx / s, fy0 * sy / s) : 1;
+        const comb = 1 / Math.max(1, Math.hypot(fx0, fy0));
         Fx = mu * fx0 * comb; Fy = mu * fy0 * comb;
         slipMax = Math.max(slipMax, Math.abs(alpha), Math.min(1, Math.abs(kappa)) * 0.5);
       } else {
         // walking pace: the tyre is a velocity constraint (stiction), capped by the friction circle
         // longitudinal: drive passes straight through; the brake is a constraint that stops the car
         // and then holds it (on a slope too) up to the brake's torque; free rolling has no hold
-        const c = MASS / 4 / (dt * 6);
-        const bMax = tBrake / R_W;
-        Fx = tDrive / R_W + (bMax > 0 ? THREE.MathUtils.clamp(-vx * c, -bMax, bMax) : 0);
-        Fy = -vy * c;
-        const mag = Math.hypot(Fx, Fy);
-        if (mag > mu) { Fx *= mu / mag; Fy *= mu / mag; }
+        Fx = tDrive / R_W; Fy = 0;
+        contacts.push({ wh, r, fw, lat, mu, bMax: tBrake / R_W, fx: Fx * dt, fy: 0 });
         wh.omega = vx / R_W;                                              // rolling, no slip
         wh.kappa = 0;
       }
@@ -243,6 +247,11 @@ export class Vehicle {
       }
       // rolling resistance
       Fx -= Math.sign(vx) * Math.min(Math.abs(vx) * 50, CRR * Fz);
+      const magnitude = Math.hypot(Fx, Fy);
+      if (magnitude > mu) { Fx *= mu / magnitude; Fy *= mu / magnitude; }
+      wh.Fx = Fx; wh.Fy = Fy;
+      const contact = contacts.find(c => c.wh === wh);
+      if (contact) contact.fx = Fx * dt;
       const Fw = n.clone().multiplyScalar(Fz).addScaledVector(fw, Fx).addScaledVector(lat, Fy);
       F.add(Fw);
       T.add(new THREE.Vector3().crossVectors(r, Fw));
@@ -259,6 +268,30 @@ export class Vehicle {
     this.w.copy(wb.applyMatrix3(R));
     if (this.w.length() > 8) this.w.setLength(8);
 
+    // Projected Gauss-Seidel contact impulses use the predicted velocity,
+    // including gravity and suspension. Accumulated impulses obey one friction disk.
+    const invI = v => {
+      const b = v.clone().applyMatrix3(Rt);
+      b.set(b.x / I_BODY[0], b.y / I_BODY[1], b.z / I_BODY[2]);
+      return b.applyMatrix3(R);
+    };
+    for (let iteration = 0; iteration < 32; iteration++) {
+      for (const c of contacts) {
+        const { r, fw, lat, wh } = c;
+        const vc = this.vel.clone().add(new THREE.Vector3().crossVectors(this.w, r));
+        const effective = axis => 1 / MASS + new THREE.Vector3().crossVectors(invI(new THREE.Vector3().crossVectors(r, axis)), r).dot(axis);
+        let fx = c.bMax > 0 ? THREE.MathUtils.clamp(c.fx - vc.dot(fw) / effective(fw), -c.bMax * dt, c.bMax * dt) : c.fx;
+        let fy = c.fy - vc.dot(lat) / effective(lat);
+        const scale = Math.min(1, c.mu * dt / (Math.hypot(fx, fy) || 1));
+        fx *= scale; fy *= scale;
+        const impulse = fw.clone().multiplyScalar(fx - c.fx).addScaledVector(lat, fy - c.fy);
+        this.vel.addScaledVector(impulse, 1 / MASS);
+        this.w.add(invI(new THREE.Vector3().crossVectors(r, impulse)));
+        c.fx = fx; c.fy = fy;
+        wh.Fx = fx / dt; wh.Fy = fy / dt;
+      }
+    }
+    this._acceleration = this.vel.clone().sub(velocityBefore).multiplyScalar(1 / dt);
     const np = this.p.clone().addScaledVector(this.vel, dt);
     // buildings: test the base_link pose of the next step; a hit kills the motion into the wall
     const yaw = Math.atan2(ex.y, ex.x);
@@ -273,9 +306,7 @@ export class Vehicle {
     }
     const dq = new THREE.Quaternion(this.w.x * dt * 0.5, this.w.y * dt * 0.5, this.w.z * dt * 0.5, 0).multiply(this.q);
     this.q.x += dq.x; this.q.y += dq.y; this.q.z += dq.z; this.q.w += dq.w; this.q.normalize();
-    // fell through the world (tile not loaded yet): put it back on whatever is below
-    const g0 = this._ground(this.p.x, this.p.y);
-    if (g0 && this.p.z < g0.z + 0.1) { this.p.z = g0.z + CG_H; this.vel.z = Math.max(0, this.vel.z); }
+
   }
 
   _ackermann(y) {
@@ -299,7 +330,8 @@ export class Vehicle {
     this.v = this.vx;
     this.vy = this.vel.dot(ey) - LR * this.w.z;
     this.yawRate = this.w.z;
-    this.latAcc = this.v * this.yawRate;
+    const bodyLeft = new THREE.Vector3(0, 1, 0).applyQuaternion(this.q);
+    this.latAcc = this._acceleration ? this._acceleration.dot(bodyLeft) : 0;
     this.a = this._aFilt = (this._aFilt ?? 0) * 0.9 + 0.1 * ((this.v - vPrev) / (1 / 60));
   }
 
